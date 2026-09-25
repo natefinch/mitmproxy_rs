@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::messages::{ConnectionIdGenerator, TransportCommand, TransportEvent, TunnelInfo};
@@ -12,6 +14,7 @@ use futures_util::SinkExt;
 use futures_util::StreamExt;
 
 use prost::Message;
+use prost::bytes::Buf;
 use prost::bytes::Bytes;
 use prost::bytes::BytesMut;
 
@@ -246,7 +249,12 @@ impl ConnectionTask {
         loop {
             tokio::select! {
                 _ = self.shutdown.recv() => break,
-                Some(packet) = stream.next(), if state.packet_queue_len() < 10 => {
+                packet = stream.next(), if state.packet_queue_len() < 10 => {
+                    let Some(packet) = packet else {
+                        // extension closed the flow
+                        state.close();
+                        break;
+                    };
                     let packet = ipc::UdpPacket::decode(
                         packet.context("IPC read error")?
                     ).context("invalid IPC message")?;
@@ -335,18 +343,25 @@ impl ConnectionTask {
             tokio::select! {
                 _ = self.shutdown.recv() => break,
                 Ok(()) = self.stream.writable(), if !write_buf.is_empty() => {
-                    let Ok(_) = self.stream.write_buf(&mut write_buf).await else {
-                        break;  // Client has disconnected.
-                    };
+                    match self.stream.try_write(&write_buf) {
+                        Ok(n) => write_buf.advance(n),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(_) => break, // Client has disconnected.
+                    }
                     if write_buf.is_empty()
                         && let Some(tx) = drain_tx.take() {
                             tx.send(()).ok();
                         }
                 },
                 Ok(()) = self.stream.readable(), if read_tx.is_some() => {
-                    let (n, tx) = read_tx.take().unwrap();
-                    let mut data = Vec::with_capacity(n);
-                    self.stream.read_buf(&mut data).await.context("failed to read from socket")?;
+                    let mut data = Vec::with_capacity(read_tx.as_ref().unwrap().0);
+                    // Readiness may be stale. Waiting here would block writes and shutdown.
+                    match self.stream.try_read_buf(&mut data) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(e) => return Err(e).context("failed to read from socket"),
+                    }
+                    let (_, tx) = read_tx.take().unwrap();
                     tx.send(data).ok();
                 },
                 Some(command) = command_rx.recv() => {
@@ -378,5 +393,225 @@ impl ConnectionTask {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+    use tokio::sync::watch;
+
+    fn udp_handshake() -> NewFlow {
+        NewFlow {
+            message: Some(ipc::new_flow::Message::Udp(UdpFlow {
+                local_address: Some(ipc::Address {
+                    host: "127.0.0.1".into(),
+                    port: 12345,
+                }),
+                tunnel_info: Some(ipc::TunnelInfo {
+                    pid: Some(42),
+                    process_name: Some("test".into()),
+                }),
+            })),
+        }
+    }
+
+    async fn write_handshake(client: &mut UnixStream, handshake: &NewFlow) {
+        let bytes = handshake.encode_to_vec();
+        client.write_u32(bytes.len() as u32).await.unwrap();
+        client.write_all(&bytes).await.unwrap();
+        client.flush().await.unwrap();
+    }
+
+    async fn spawn_connection_task(
+        server: UnixStream,
+    ) -> (
+        tokio::task::JoinHandle<Result<()>>,
+        mpsc::Receiver<TransportEvent>,
+        watch::Sender<()>,
+    ) {
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = shutdown::channel();
+        let handle = tokio::spawn(ConnectionTask::new(server, events_tx, shutdown_rx).run());
+        (handle, events_rx, shutdown_tx)
+    }
+
+    /// Redirector EOF before the first datagram must complete the task.
+    /// `Some(packet) = stream.next()` ignores `None`, so the UnixStream leaked forever.
+    #[tokio::test]
+    async fn udp_eof_before_first_datagram_completes() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (handle, mut events_rx, _shutdown_tx) = spawn_connection_task(server).await;
+
+        write_handshake(&mut client, &udp_handshake()).await;
+        drop(client);
+
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("UDP task hung after redirector EOF before the first datagram")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            events_rx.try_recv().is_err(),
+            "ConnectionEstablished must not be sent when no datagram arrived"
+        );
+    }
+
+    /// EOF after a datagram must also complete without waiting for CloseConnection.
+    #[tokio::test]
+    async fn udp_eof_after_first_datagram_completes() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (handle, mut events_rx, _shutdown_tx) = spawn_connection_task(server).await;
+
+        write_handshake(&mut client, &udp_handshake()).await;
+
+        let mut framed = Framed::new(client, LengthDelimitedCodec::new());
+        let packet = ipc::UdpPacket {
+            data: Bytes::from_static(b"hello"),
+            remote_address: Some(ipc::Address {
+                host: "8.8.8.8".into(),
+                port: 53,
+            }),
+        };
+        framed
+            .send(Bytes::from(packet.encode_to_vec()))
+            .await
+            .unwrap();
+        drop(framed);
+
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("UDP task hung after redirector EOF following a datagram")
+            .unwrap()
+            .unwrap();
+
+        match events_rx.try_recv() {
+            Ok(TransportEvent::ConnectionEstablished { .. }) => {}
+            other => panic!("expected ConnectionEstablished, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_pending_read_does_not_block_writes() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (task, mut events, shutdown_tx) = spawn_connection_task(server).await;
+        write_handshake(
+            &mut client,
+            &NewFlow {
+                message: Some(ipc::new_flow::Message::Tcp(TcpFlow {
+                    remote_address: Some(ipc::Address {
+                        host: "127.0.0.1".into(),
+                        port: 443,
+                    }),
+                    tunnel_info: None,
+                })),
+            },
+        )
+        .await;
+        let TransportEvent::ConnectionEstablished {
+            connection_id,
+            command_tx: Some(commands),
+            ..
+        } = events.recv().await.unwrap()
+        else {
+            panic!("expected TCP connection");
+        };
+
+        let (first_tx, first_rx) = oneshot::channel();
+        commands
+            .send(TransportCommand::ReadData(connection_id, 1, first_tx))
+            .unwrap();
+        client.write_all(b"a").await.unwrap();
+        assert_eq!(first_rx.await.unwrap(), b"a");
+
+        let (second_tx, second_rx) = oneshot::channel();
+        commands
+            .send(TransportCommand::ReadData(connection_id, 1, second_tx))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        commands
+            .send(TransportCommand::WriteData(
+                connection_id,
+                b"reply".to_vec(),
+            ))
+            .unwrap();
+        let (drain_tx, drain_rx) = oneshot::channel();
+        commands
+            .send(TransportCommand::DrainWriter(connection_id, drain_tx))
+            .unwrap();
+        let mut response = [0; 5];
+        timeout(Duration::from_millis(250), client.read_exact(&mut response))
+            .await
+            .expect("pending client read blocked response delivery")
+            .unwrap();
+        assert_eq!(&response, b"reply");
+        timeout(Duration::from_millis(250), drain_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        client.write_all(b"b").await.unwrap();
+        assert_eq!(second_rx.await.unwrap(), b"b");
+        drop(shutdown_tx);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_backpressure_does_not_block_reads_or_shutdown() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (task, mut events, shutdown_tx) = spawn_connection_task(server).await;
+        write_handshake(
+            &mut client,
+            &NewFlow {
+                message: Some(ipc::new_flow::Message::Tcp(TcpFlow {
+                    remote_address: Some(ipc::Address {
+                        host: "127.0.0.1".into(),
+                        port: 443,
+                    }),
+                    tunnel_info: None,
+                })),
+            },
+        )
+        .await;
+        let TransportEvent::ConnectionEstablished {
+            connection_id,
+            command_tx: Some(commands),
+            ..
+        } = events.recv().await.unwrap()
+        else {
+            panic!("expected TCP connection");
+        };
+
+        commands
+            .send(TransportCommand::WriteData(
+                connection_id,
+                vec![0; 1024 * 1024],
+            ))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let (read_tx, read_rx) = oneshot::channel();
+        commands
+            .send(TransportCommand::ReadData(connection_id, 1, read_tx))
+            .unwrap();
+        client.write_all(b"a").await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), read_rx)
+                .await
+                .expect("blocked write prevented reading client data")
+                .unwrap(),
+            b"a",
+        );
+        drop(shutdown_tx);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("blocked write prevented shutdown")
+            .unwrap()
+            .unwrap();
     }
 }
